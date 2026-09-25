@@ -1,0 +1,9 @@
+DiscoRL in C++
+
+This project is a C++ reimplementation of DiscoRL,
+https://github.com/google-deepmind/disco_rl
+Copyright 2025 Google LLC, licensed under the Apache License, Version 2.0.
+
+The update rules, networks, value estimation and meta-training follow the
+Python/JAX sources of disco_rl, ported to C++ and LibTorch. No weights from
+disco_rl are included.
