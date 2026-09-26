@@ -22,6 +22,7 @@ struct Rollout {
   Tensors agent_outs;         // [T, B, ...] of the acting network: "logits"
 
   Rollout slice(int64_t batch_begin, int64_t batch_end) const;
+  Rollout to(const torch::Device &device) const;
   static Rollout cat(const std::vector<Rollout> &rollouts); // along batch
 };
 

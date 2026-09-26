@@ -29,6 +29,15 @@ Rollout Rollout::slice(int64_t batch_begin, int64_t batch_end) const {
   return out;
 }
 
+Rollout Rollout::to(const torch::Device &device) const {
+  Rollout out{observations.to(device), actions.to(device), rewards.to(device),
+              discounts.to(device), {}};
+  for (const auto &[name, value] : agent_outs) {
+    out.agent_outs[name] = value.to(device);
+  }
+  return out;
+}
+
 Rollout Rollout::cat(const std::vector<Rollout> &rollouts) {
   const auto join = [&](auto field) {
     std::vector<torch::Tensor> parts;
