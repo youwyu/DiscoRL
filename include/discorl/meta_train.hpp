@@ -3,6 +3,7 @@
 #include <functional>
 #include <memory>
 #include <random>
+#include <string>
 #include <vector>
 
 #include <torch/torch.h>
@@ -36,11 +37,16 @@ struct MetaTrainConfig {
   // Backpropagate through one agent update at a time, recomputing it from
   // stored inputs: memory for one update instead of all of them.
   bool recompute = true;
-  // GPUs cuda:0 to cuda:num_devices-1 the agents are spread over, and the
-  // agents computing their meta-gradients at once on each, each needing
-  // memory for one update's graph.
-  int64_t num_devices = 1;
+  // Agents computing their meta-gradients at once on the GPU, each on its own
+  // stream and with memory for one update's graph.
   int64_t parallel_agents = 1;
+  // The population split over `processes` processes, this one `rank`: each
+  // runs the agents rank, rank + processes, ..., and after every meta-step
+  // they exchange their meta-updates through files in `exchange_dir`, where
+  // rank 0 applies the average.
+  int64_t processes = 1, rank = 0;
+  std::string exchange_dir;
+  double exchange_timeout = 3600; // s to wait for the other processes
   // Keep each agent's state and replay in host memory between its turns, and
   // the inputs of its updates until the backward pass reaches them, so the
   // GPU holds only the agents in flight.
@@ -130,7 +136,8 @@ private:
   struct Member {
     int64_t task = 0, steps = 0, lifetime = 0; // steps: experience used
     double reward = 0.0;
-    size_t device = 0; // index into devices_
+    int64_t index = 0;     // in the whole population
+    int64_t lifetimes = 0; // started
     std::unique_ptr<Environment> env;
     std::unique_ptr<Environment> meta_env; // Disco103: meta_batch envs
     TimeStep meta_timestep;
@@ -145,9 +152,11 @@ private:
   void start_lifetime(int64_t index);
   Tensors discovery_step();
   Tensors colab_step();
-  bool run_agents(const std::function<void(int64_t)> &fn, int64_t per_device);
-  void replicate();
+  bool run_agents(const std::function<void(int64_t)> &fn, int64_t threads);
   void synchronize() const;
+  void exchange(std::vector<torch::Tensor> &grads,
+                std::vector<torch::Tensor> &updates, Tensors &logs,
+                std::vector<double> &totals);
   Tensors apply_meta_update(std::vector<MetaGradient> &results, double positive,
                             double negative);
 
@@ -159,14 +168,12 @@ private:
   torch::TensorOptions options_;
   uint64_t seed_;
   std::mt19937_64 rng_;
-  uint64_t lifetimes_started_ = 0;
   Params meta_params_;
   std::unique_ptr<torch::optim::Adam> optimizer_;
   Optimizer agent_adam_;              // per-agent meta-optimizer
   std::vector<AdamState> agent_adam_states_;
-  std::vector<torch::Device> devices_;
-  std::vector<Params> replicas_;      // the meta-parameters on each device
   std::vector<c10::Stream> streams_;  // one per worker, kept across steps
+  int64_t exchanges_ = 0;
   std::vector<Member> members_;
 };
 

@@ -1,11 +1,11 @@
 #include "discorl/meta_train.hpp"
 
+#include <chrono>
 #include <exception>
+#include <filesystem>
 #include <limits>
 #include <numeric>
 #include <thread>
-
-#include <c10/core/DeviceGuard.h>
 
 #if __has_include(<c10/cuda/CUDAGuard.h>)
 #include <c10/cuda/CUDAFunctions.h>
@@ -361,41 +361,29 @@ MetaTrainer::MetaTrainer(MetaTrainConfig config, AgentConfig agent_config,
       value_config_(std::move(value_config)),
       rule_(std::make_shared<DiscoRule>(std::move(rule_config))),
       suite_(std::move(suite)), options_(with_device_index(options)),
-      seed_(seed), rng_(seed),
+      seed_(seed), rng_(seed + config_.rank),
       meta_params_(discorl::detached(to(meta_params, options_), true)) {
   optimizer_ = std::make_unique<torch::optim::Adam>(
       values(meta_params_), torch::optim::AdamOptions(config_.learning_rate));
   agent_adam_.learning_rate = config_.learning_rate;
   agent_adam_.max_abs_update = std::numeric_limits<double>::infinity();
-  devices_.push_back(options_.device());
-  if (options_.device().is_cuda()) {
-    for (int64_t d = 0; static_cast<int64_t>(devices_.size()) < config_.num_devices;
-         ++d) {
-      if (d != options_.device().index()) {
-        devices_.emplace_back(torch::kCUDA, d);
-      }
-    }
-  }
-  replicas_.resize(devices_.size());
-  members_.resize(config_.num_agents);
-  for (int64_t i = 0; i < config_.num_agents; ++i) {
-    members_[i].device = i % devices_.size();
+  for (int64_t i = config_.rank; i < config_.num_agents;
+       i += config_.processes) {
+    members_.emplace_back();
+    members_.back().index = i;
     agent_adam_states_.push_back(agent_adam_.init(meta_params_));
     if (config_.offload) {
       move(agent_adam_states_.back(), torch::kCPU);
     }
-    start_lifetime(i);
+    start_lifetime(static_cast<int64_t>(members_.size()) - 1);
   }
 }
 
 void MetaTrainer::start_lifetime(int64_t index) {
   Member &member = members_[index];
-  const auto device = devices_[member.device];
-  const c10::DeviceGuard guard(device);
-  const auto options = options_.device(device);
   member.task =
       config_.num_agents >= suite_.size
-          ? index % suite_.size
+          ? member.index % suite_.size
           : std::uniform_int_distribution<int64_t>(0, suite_.size - 1)(rng_);
   member.steps = 0;
   member.lifetime = 0;
@@ -407,17 +395,19 @@ void MetaTrainer::start_lifetime(int64_t index) {
     member.lifetime = config_.lifetimes[std::discrete_distribution<size_t>(
         weights.begin(), weights.end())(rng_)];
   }
-  const uint64_t seed = seed_ + 1 + lifetimes_started_++;
+  const uint64_t seed = seed_ + 1 + uint64_t(member.index) +
+                        (uint64_t(member.lifetimes++) << 32);
   if (config_.update_batch > 0) {
     const auto fresh = std::max<int64_t>(
         1, std::llround(config_.update_batch * (1 - config_.replay_fraction)));
-    member.env = suite_.make(member.task, fresh, seed, device);
+    member.env = suite_.make(member.task, fresh, seed, options_.device());
     member.meta_env = suite_.make(member.task, config_.meta_batch,
-                                  seed + (uint64_t(1) << 32), device);
+                                  seed + (uint64_t(1) << 40), options_.device());
     member.meta_timestep = member.meta_env->reset();
     member.replay = std::make_unique<ReplayBuffer>(config_.replay_capacity, seed);
   } else {
-    member.env = suite_.make(member.task, config_.batch_size, seed, device);
+    member.env =
+        suite_.make(member.task, config_.batch_size, seed, options_.device());
   }
   member.agent = std::make_unique<Agent>(agent_config_, rule_,
                                          member.env->observation_size(),
@@ -425,8 +415,8 @@ void MetaTrainer::start_lifetime(int64_t index) {
   member.value_fn = std::make_unique<ValueFunction>(
       value_config_, member.env->observation_size());
   member.timestep = member.env->reset();
-  member.learner = member.agent->initial_learner_state(options);
-  member.value = member.value_fn->initial_state(options);
+  member.learner = member.agent->initial_learner_state(options_);
+  member.value = member.value_fn->initial_state(options_);
   if (config_.offload) {
     move(member.learner, torch::kCPU);
     move(member.value, torch::kCPU);
@@ -464,40 +454,27 @@ Tensors MetaTrainer::step() {
       start_lifetime(i);
     }
   }
-  replicate();
   return config_.update_batch > 0 ? discovery_step() : colab_step();
-}
-
-// The meta-parameters on every device, as leaves for the meta-gradients.
-void MetaTrainer::replicate() {
-  for (size_t d = 0; d < devices_.size(); ++d) {
-    replicas_[d] = d == 0 ? meta_params_
-                          : discorl::detached(
-                                to(meta_params_, options_.device(devices_[d])),
-                                true);
-  }
 }
 
 void MetaTrainer::synchronize() const {
 #ifdef DISCORL_CUDA_STREAMS
-  for (const auto &device : devices_) {
-    if (device.is_cuda()) {
-      c10::cuda::getCurrentCUDAStream(device.index()).synchronize();
-    }
+  if (options_.device().is_cuda()) {
+    c10::cuda::getCurrentCUDAStream(options_.device().index()).synchronize();
   }
 #endif
 }
 
 // Disco103's meta-step: each agent updates num_inner_steps times on fresh and
-// replayed trajectories and returns its meta-gradient; parallel_agents at once
-// on each device.
+// replayed trajectories and returns its meta-gradient; parallel_agents at
+// once.
 Tensors MetaTrainer::discovery_step() {
   const int64_t n = static_cast<int64_t>(members_.size());
   std::vector<MetaGradient> results(n);
   std::vector<double> positive(n, 0.0), negative(n, 0.0);
+  const auto device = options_.device();
   auto run = [&](int64_t i) {
     Member &m = members_[i];
-    const auto device = devices_[m.device];
     if (config_.offload) {
       move(m.learner, device);
       move(m.value, device);
@@ -523,7 +500,7 @@ Tensors MetaTrainer::discovery_step() {
       m.steps += rollout.rewards.numel();
       return rollout;
     };
-    results[i] = discovery_gradient(*m.agent, *m.value_fn, replicas_[m.device],
+    results[i] = discovery_gradient(*m.agent, *m.value_fn, meta_params_,
                                     m.learner, m.value, next_batch, act,
                                     config_);
     m.learner = std::move(results[i].learner);
@@ -540,40 +517,30 @@ Tensors MetaTrainer::discovery_step() {
       std::accumulate(negative.begin(), negative.end(), 0.0));
 }
 
-// Runs fn for every member: per_device worker threads on each device, each
-// with its own stream and its own fixed share of the device's members, so a
-// member's tensors always live on one stream. Sequential on one device with
-// per_device 1, or on the CPU; true when it ran concurrently.
+// Runs fn for every member; on the GPU `threads` at once, worker w taking
+// members w, w + threads, ... on its own stream, so a member's tensors always
+// live on one stream. True when it ran concurrently.
 bool MetaTrainer::run_agents(const std::function<void(int64_t)> &fn,
-                             int64_t per_device) {
+                             int64_t threads) {
   const int64_t n = static_cast<int64_t>(members_.size());
-  const int64_t num_devices = static_cast<int64_t>(devices_.size());
+  threads = std::min(threads, n);
 #ifdef DISCORL_CUDA_STREAMS
-  if (options_.device().is_cuda() && (per_device > 1 || num_devices > 1)) {
-    // Workers' streams do not wait for the devices' current streams: finish
-    // the last meta-update, the new lifetimes and the replicas first.
+  if (options_.device().is_cuda() && threads > 1) {
+    // Workers' streams do not wait for this one: finish the last meta-update
+    // and the new lifetimes first.
     synchronize();
-    std::vector<std::vector<int64_t>> shares(num_devices * per_device);
-    std::vector<int64_t> count(num_devices, 0);
-    for (int64_t i = 0; i < n; ++i) {
-      const int64_t d = static_cast<int64_t>(members_[i].device);
-      shares[d * per_device + count[d]++ % per_device].push_back(i);
-    }
-    while (streams_.size() < shares.size()) {
-      const auto device = devices_[streams_.size() / per_device].index();
+    const auto device = options_.device().index();
+    while (static_cast<int64_t>(streams_.size()) < threads) {
       streams_.push_back(c10::cuda::getStreamFromPool(false, device).unwrap());
     }
     std::vector<std::exception_ptr> errors(n);
     std::vector<std::thread> workers;
-    for (size_t w = 0; w < shares.size(); ++w) {
-      if (shares[w].empty()) {
-        continue;
-      }
+    for (int64_t w = 0; w < threads; ++w) {
       workers.emplace_back([&, w] {
+        C10_CUDA_CHECK(c10::cuda::SetDevice(device, /*force=*/true));
         const c10::cuda::CUDAStream stream(streams_[w]);
-        C10_CUDA_CHECK(c10::cuda::SetDevice(stream.device_index(), true));
         c10::cuda::CUDAStreamGuard guard(stream);
-        for (const int64_t i : shares[w]) {
+        for (int64_t i = w; i < n; i += threads) {
           try {
             fn(i);
           } catch (...) {
@@ -627,10 +594,9 @@ Tensors MetaTrainer::colab_step() {
   std::vector<MetaGradient> results(n);
   for (int64_t i = 0; i < n; ++i) {
     Member &member = members_[i];
-    const c10::DeviceGuard guard(devices_[member.device]);
-    results[i] = meta_gradient(*member.agent, *member.value_fn,
-                               replicas_[member.device], member.learner,
-                               member.value, train[i], valid[i], config_);
+    results[i] = meta_gradient(*member.agent, *member.value_fn, meta_params_,
+                               member.learner, member.value, train[i],
+                               valid[i], config_);
     member.learner = std::move(results[i].learner);
     member.value = std::move(results[i].value);
     for (const auto &rollout : train[i]) {
@@ -645,54 +611,36 @@ Tensors MetaTrainer::colab_step() {
 
 Tensors MetaTrainer::apply_meta_update(std::vector<MetaGradient> &results,
                                        double positive, double negative) {
+  torch::NoGradGuard no_grad;
   const int64_t n = static_cast<int64_t>(results.size());
-  // Each agent's meta-gradient on the main device, clipped.
-  std::vector<std::vector<torch::Tensor>> agent_grads(n);
-  for (int64_t i = 0; i < n; ++i) {
-    agent_grads[i] = values(to(results[i].grads, options_));
-    if (config_.max_grad_norm > 0) {
-      torch::Tensor squared = torch::zeros({}, agent_grads[i].front().options());
-      for (const auto &g : agent_grads[i]) {
-        squared = squared + g.square().sum();
-      }
-      const auto scale =
-          (config_.max_grad_norm / (squared.sqrt() + 1e-6)).clamp_max(1.0);
-      for (auto &g : agent_grads[i]) {
-        g = g * scale;
-      }
-    }
-  }
-  std::vector<torch::Tensor> grads = agent_grads[0];
-  for (int64_t i = 1; i < n; ++i) {
-    for (size_t k = 0; k < grads.size(); ++k) {
-      grads[k] = grads[k] + agent_grads[i][k];
-    }
-  }
+  auto params = values(meta_params_);
+  // This process's share: its agents' clipped meta-gradients and, with
+  // per-agent Adam, their updates Adam_i(g_i), summed.
+  std::vector<torch::Tensor> grads(params.size()), updates(params.size());
   Tensors logs;
   double rewards = 0.0;
   for (int64_t i = 0; i < n; ++i) {
-    for (const auto &[name, value] : results[i].logs) {
-      logs[name] = logs.count(name) ? logs[name] + value : value;
-    }
-    rewards += members_[i].reward;
-  }
-  auto params = values(meta_params_);
-  torch::Tensor squared_norm = torch::zeros({}, grads.front().options());
-  for (size_t k = 0; k < params.size(); ++k) {
-    squared_norm = squared_norm + (grads[k] / n).square().sum();
-  }
-  if (config_.per_agent_adam) {
-    // eta += 1/n sum_i Adam_i(g_i).
-    torch::NoGradGuard no_grad;
-    std::vector<torch::Tensor> update(params.size());
-    const auto device = options_.device();
-    for (int64_t i = 0; i < n; ++i) {
-      if (config_.offload) {
-        move(agent_adam_states_[i], device);
+    auto g = values(to(results[i].grads, options_));
+    if (config_.max_grad_norm > 0) {
+      torch::Tensor squared = torch::zeros({}, g.front().options());
+      for (const auto &x : g) {
+        squared = squared + x.square().sum();
       }
-      auto [next, state] =
-          agent_adam_.step(meta_params_, with_values(meta_params_, agent_grads[i]),
-                           agent_adam_states_[i]);
+      const auto scale =
+          (config_.max_grad_norm / (squared.sqrt() + 1e-6)).clamp_max(1.0);
+      for (auto &x : g) {
+        x = x * scale;
+      }
+    }
+    for (size_t k = 0; k < params.size(); ++k) {
+      grads[k] = grads[k].defined() ? grads[k] + g[k] : g[k];
+    }
+    if (config_.per_agent_adam) {
+      if (config_.offload) {
+        move(agent_adam_states_[i], options_.device());
+      }
+      auto [next, state] = agent_adam_.step(
+          meta_params_, with_values(meta_params_, g), agent_adam_states_[i]);
       agent_adam_states_[i] = std::move(state);
       if (config_.offload) {
         move(agent_adam_states_[i], torch::kCPU);
@@ -700,31 +648,163 @@ Tensors MetaTrainer::apply_meta_update(std::vector<MetaGradient> &results,
       const auto next_values = values(next);
       for (size_t k = 0; k < params.size(); ++k) {
         const auto delta = next_values[k] - params[k];
-        update[k] = i == 0 ? delta : update[k] + delta;
+        updates[k] = updates[k].defined() ? updates[k] + delta : delta;
       }
     }
-    for (size_t k = 0; k < params.size(); ++k) {
-      params[k].add_(update[k] / n);
+    for (const auto &[name, value] : results[i].logs) {
+      const auto here = value.to(options_.device());
+      logs[name] = logs.count(name) ? logs[name] + here : here;
     }
-  } else {
-    for (size_t k = 0; k < params.size(); ++k) {
-      params[k].mutable_grad() = grads[k] / n;
-    }
-    optimizer_->step();
-    optimizer_->zero_grad();
+    rewards += members_[i].reward;
   }
-
+  // Totals over the whole population: agents, rewards, positive and negative
+  // rewards.
+  std::vector<double> totals{static_cast<double>(n), rewards, positive,
+                             negative};
+  if (config_.processes > 1) {
+    exchange(grads, updates, logs, totals);
+  } else {
+    if (config_.per_agent_adam) {
+      // eta += 1/n sum_i Adam_i(g_i).
+      for (size_t k = 0; k < params.size(); ++k) {
+        params[k].add_(updates[k] / totals[0]);
+      }
+    } else {
+      for (size_t k = 0; k < params.size(); ++k) {
+        params[k].mutable_grad() = grads[k] / totals[0];
+      }
+      optimizer_->step();
+      optimizer_->zero_grad();
+    }
+  }
+  torch::Tensor squared_norm = torch::zeros({}, options_);
+  for (const auto &g : grads) {
+    squared_norm = squared_norm + (g / totals[0]).square().sum();
+  }
   for (auto &[name, value] : logs) {
-    value = value / n;
+    value = value / totals[0];
   }
   logs["meta_grad_norm"] = squared_norm.sqrt();
-  logs["rewards"] = torch::tensor(rewards / n);
-  logs["pos_rewards"] = torch::tensor(positive / n);
-  logs["neg_rewards"] = torch::tensor(negative / n);
+  logs["rewards"] = torch::tensor(totals[1] / totals[0]);
+  logs["pos_rewards"] = torch::tensor(totals[2] / totals[0]);
+  logs["neg_rewards"] = torch::tensor(totals[3] / totals[0]);
   // Tensors from the workers' streams are freed after this: finish reading
   // them first, as those streams may reuse their memory.
   synchronize();
   return logs;
+}
+
+// Ranks above 0 send their sums to rank 0, which adds them all, applies the
+// meta-update and publishes the new meta-parameters for the others to load.
+void MetaTrainer::exchange(std::vector<torch::Tensor> &grads,
+                           std::vector<torch::Tensor> &updates, Tensors &logs,
+                           std::vector<double> &totals) {
+  namespace fs = std::filesystem;
+  const fs::path dir(config_.exchange_dir);
+  fs::create_directories(dir);
+  const auto step = std::to_string(exchanges_++);
+  const auto name = [&](const std::string &what) { return dir / (what + ".npz"); };
+  const auto write = [&](const Tensors &arrays, const fs::path &path) {
+    const fs::path partial = path.string() + ".partial";
+    save_npz(partial.string(), arrays);
+    fs::rename(partial, path);
+  };
+  const auto wait = [&](const fs::path &path) {
+    const auto start = std::chrono::steady_clock::now();
+    while (!fs::exists(path)) {
+      if (std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                        start)
+              .count() > config_.exchange_timeout) {
+        throw std::runtime_error("meta-training: no " + path.string() +
+                                 " from the other processes");
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  };
+  std::vector<std::string> keys;
+  for (const auto &[key, value] : meta_params_) {
+    keys.push_back(key);
+  }
+  if (config_.rank > 0) {
+    Tensors sums;
+    for (size_t k = 0; k < keys.size(); ++k) {
+      sums["g/" + keys[k]] = grads[k].cpu();
+      if (config_.per_agent_adam) {
+        sums["u/" + keys[k]] = updates[k].cpu();
+      }
+    }
+    for (const auto &[key, value] : logs) {
+      sums["l/" + key] = value.cpu();
+    }
+    sums["totals"] = torch::tensor(totals, torch::kFloat64);
+    write(sums, name(step + ".rank" + std::to_string(config_.rank)));
+  } else {
+    for (int64_t r = 1; r < config_.processes; ++r) {
+      const auto path = name(step + ".rank" + std::to_string(r));
+      wait(path);
+      const auto sums = load_npz(path.string());
+      for (size_t k = 0; k < keys.size(); ++k) {
+        grads[k] = grads[k] + sums.at("g/" + keys[k]).to(options_);
+        if (config_.per_agent_adam) {
+          updates[k] = updates[k] + sums.at("u/" + keys[k]).to(options_);
+        }
+      }
+      for (auto &[key, value] : logs) {
+        value = value + sums.at("l/" + key).to(options_);
+      }
+      const auto theirs = sums.at("totals");
+      for (size_t t = 0; t < totals.size(); ++t) {
+        totals[t] += theirs[t].item<double>();
+      }
+    }
+  }
+  // The population's totals, and the new meta-parameters from rank 0.
+  auto params = values(meta_params_);
+  if (config_.rank == 0) {
+    if (config_.per_agent_adam) {
+      for (size_t k = 0; k < params.size(); ++k) {
+        params[k].add_(updates[k] / totals[0]);
+      }
+    } else {
+      for (size_t k = 0; k < params.size(); ++k) {
+        params[k].mutable_grad() = grads[k] / totals[0];
+      }
+      optimizer_->step();
+      optimizer_->zero_grad();
+    }
+    Tensors published = to(discorl::detached(meta_params_),
+                           torch::TensorOptions(torch::kCPU));
+    for (auto &[key, value] : logs) {
+      published["l/" + key] = value.cpu();
+    }
+    for (size_t k = 0; k < keys.size(); ++k) {
+      published["g/" + keys[k]] = grads[k].cpu();
+    }
+    published["totals"] = torch::tensor(totals, torch::kFloat64);
+    write(published, name(step + ".params"));
+    if (exchanges_ > 1) {
+      const auto previous = std::to_string(exchanges_ - 2);
+      for (int64_t r = 1; r < config_.processes; ++r) {
+        fs::remove(name(previous + ".rank" + std::to_string(r)));
+      }
+      fs::remove(name(previous + ".params"));
+    }
+  } else {
+    const auto path = name(step + ".params");
+    wait(path);
+    const auto published = load_npz(path.string());
+    for (size_t k = 0; k < keys.size(); ++k) {
+      params[k].copy_(published.at(keys[k]).to(options_));
+      grads[k] = published.at("g/" + keys[k]).to(options_);
+    }
+    for (auto &[key, value] : logs) {
+      value = published.at("l/" + key).to(options_);
+    }
+    const auto all = published.at("totals");
+    for (size_t t = 0; t < totals.size(); ++t) {
+      totals[t] = all[t].item<double>();
+    }
+  }
 }
 
 } // namespace discorl
