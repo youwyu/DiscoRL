@@ -249,17 +249,28 @@ MetaGradient discovery_gradient(const Agent &agent,
   torch::Tensor reg_loss = torch::zeros({}, meta_values.front().options());
   LearnerState state = learner;
   Objective final;
+  // The meta-value function learns the pre-update policy's values on every
+  // batch the agent updates on, as in meta_gradient; the meta-rollout alone
+  // would give it one step per meta-update.
+  ValueState value_state = value;
+  const auto learn_values = [&](const Rollout &batch, const Params &params) {
+    torch::NoGradGuard no_grad;
+    const auto logits = agent.unroll(params, batch.observations).at("logits");
+    value_state = value_fn.update(value_state, batch, logits);
+  };
 
   if (!config.recompute) {
     // One graph through every update.
     for (int64_t k = 0; k < updates; ++k) {
       const auto batch = next_batch(k, discorl::detached(state.params));
+      learn_values(batch, discorl::detached(state.params));
       auto [next, logs] = agent.learner_step(batch, state, meta_params, true);
       reg_loss = reg_loss + update_regularizer(logs, config);
       state = std::move(next);
     }
     const auto rollout = act(discorl::detached(state.params));
-    final = objective(agent, value_fn, value, state.params, rollout, config);
+    final =
+        objective(agent, value_fn, value_state, state.params, rollout, config);
     accumulate(torch::autograd::grad({final.loss + reg_loss}, meta_values, {},
                                      false, false, true),
                0);
@@ -271,6 +282,7 @@ MetaGradient discovery_gradient(const Agent &agent,
     const auto device = meta_values.front().device();
     for (int64_t k = 0; k < updates; ++k) {
       batches.push_back(next_batch(k, state.params));
+      learn_values(batches.back(), state.params);
       inputs.push_back(state);
       if (config.offload) {
         move(inputs.back(), torch::kCPU);
@@ -280,7 +292,8 @@ MetaGradient discovery_gradient(const Agent &agent,
     }
     const auto rollout = act(state.params);
     LearnerState last = leaves(state);
-    final = objective(agent, value_fn, value, last.params, rollout, config);
+    final =
+        objective(agent, value_fn, value_state, last.params, rollout, config);
     auto adjoint = torch::autograd::grad({final.loss}, tensors_of(last), {},
                                          false, false, true);
     // ...then back through them one at a time, recomputing each: the adjoint
